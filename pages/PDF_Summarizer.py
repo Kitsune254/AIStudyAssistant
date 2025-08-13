@@ -92,4 +92,3 @@ if uploaded_file is not None:
                 file_name=f"{filename}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
-

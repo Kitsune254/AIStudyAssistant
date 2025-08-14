@@ -1,326 +1,287 @@
 import os
+import re
 import json
-import streamlit as st
+import time
+import random
+
 import fitz  # PyMuPDF
-from typing import List, Dict, Any
-from dataclasses import dataclass
+import streamlit as st
+import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Optional: save results to docx
-from docx import Document
+# -------------------- Setup --------------------
+load_dotenv()
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if not gemini_api_key:
+    st.error("GEMINI_API_KEY is not set. Please add it to your environment or .env file.")
+    st.stop()
+genai.configure(api_key=gemini_api_key)
 
-load_dotenv()  # Load .env file
-gemini_api_key = os.getenv('GEMINI_API_KEY')
+st.set_page_config(
+    page_title="Thinkr",
+    page_icon="📖"
+)
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except Exception:
-    GEMINI_AVAILABLE = False
+st.title("PDF Question Generator & Evaluator")
 
-def gemini_configure():
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    if not gemini_api_key:
-        raise RuntimeError("Please set the GEMINI_API_KEY environment variable.")
-    if not GEMINI_AVAILABLE:
-        raise RuntimeError("google.generativeai package not installed. Install it or adapt this function.")
-    genai.configure(api_key=gemini_api_key)
+st.write("Generate sample questions from a PDF to test your knowledge of the study material. Answer the questions and get the scores"
+         " and explanation to your answers to know how much you have understood")
 
-def gemini_generate_text(prompt: str, model: str = "text-bison-001", max_output_tokens: int = 1024) -> str:
-    """
-    Calls Gemini (Generative Language) and returns the text content.
-    Replace/modify this if you use a different client or REST.
-    """
-    gemini_configure()
-    # The library may provide 'generate_text' or 'client.generate' methods depending on versions.
-    # We'll try a common interface; adapt if your library differs.
-    resp = genai.generate_text(model=model, prompt=prompt, max_output_tokens=max_output_tokens)
-    # The response object shape can differ; convert to string gracefully
-    if hasattr(resp, "text"):
-        return resp.text
-    # fallback
-    return str(resp)
-
-# ---------- Helpers ----------
-def extract_text_from_pdf(uploaded_file) -> str:
-    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    full_text = []
+# -------------------- PDF utils --------------------
+def extract_text_from_pdf(file) -> str:
+    """Extract full text from a PDF file-like object using PyMuPDF."""
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    text = []
     for page in doc:
-        text = page.get_text()
-        if text:
-            full_text.append(text)
-    return "\n\n".join(full_text)
+        text.append(page.get_text())
+    return "\n".join(text).strip()
 
-@dataclass
-class Question:
-    id: int
-    qtype: str  # 'mcq' or 'open'
-    question: str
-    options: List[str]  # only for mcq
-    correct_answer: str = None  # grader will use this; don't show to user
-    explanation: str = None
+# -------------------- LLM helpers --------------------
+def clean_json_string(json_str: str) -> str:
+    """Remove common formatting issues from LLM output to improve JSON parsing."""
+    # Strip code fences
+    json_str = re.sub(r"```(?:json)?", "", json_str).strip("` \n\t\r")
+    # Remove trailing commas before ] or }
+    json_str = re.sub(r",\s*(\]|\})", r"\1", json_str)
+    return json_str.strip()
 
-def ask_gemini_for_questions(pdf_text: str, num_questions: int = 6) -> List[Question]:
+def generate_questions_from_text(text: str, n: int = 5):
     """
-    Prompt Gemini to generate questions in strict JSON:
-    [
-      {"id":1, "type":"mcq", "question":"...", "options":["A","B","C","D"], "answer":"B", "explanation":"..."},
-      ...
-    ]
+    Ask Gemini to create questions in strict JSON. Shows a progress bar while generating.
+    Returns a list of question dicts with fields:
+    - type: "mcq" or "open"
+    - question: str
+    - options: list[str] (for mcq)
+    - answer: str (correct option for mcq, expected answer for open)
     """
+    progress = st.progress(0)
+    status = st.empty()
+
+    # Stage 1: starting
+    status.text("Starting question generation...")
+    progress.progress(10)
+    time.sleep(0.2)
+
+    # (Optional) Trim very large texts to keep prompt manageable
+    MAX_CHARS = 30000
+    trimmed_text = text[:MAX_CHARS]
+
+    # Stage 2: sending to Gemini
+    status.text("Sending prompt to Gemini 2.5 Flash...")
+    progress.progress(35)
+
+    model = genai.GenerativeModel("gemini-2.5-flash")
     prompt = f"""
-You are an assistant that reads a document and generates educational questions.
+You are a JSON-only generator.
+Create exactly {n} questions from the given text.
+Randomly choose each question to be either:
+- Multiple-choice (type "mcq") with 4 options and exactly 1 correct answer,
+- Open-ended (type "open") requiring a short written response.
 
-Instructions:
-- Read the provided document text delimited by <<DOC>> and <<ENDDOC>>.
-- Produce exactly {num_questions} questions covering the document's main ideas and details.
-- For each question produce either:
-  - an MCQ with 4 options (labelled or unlabelled) and the correct option (single letter or full option text), OR
-  - an open question where the user must type an answer.
-- Output MUST be strict JSON (no extra commentary) with an array of objects:
+Rules:
+- Respond with VALID JSON ONLY. No commentary, no markdown, no trailing commas.
+- For MCQs, "answer" must be EXACTLY one of the strings in "options".
+- Keep questions concise and specific to the text.
+
+Output JSON schema (array of length {n}):
 [
   {{
-    "id": 1,
-    "type": "mcq" or "open",
-    "question": "question text",
-    "options": ["opt1","opt2","opt3","opt4"],   // only for mcq
-    "answer": "correct option text or letter", // internal; grader will use; can be either option text or letter
-    "explanation": "brief explanation of the correct answer"
+    "type": "mcq",
+    "question": "Question text",
+    "options": ["Option 1","Option 2","Option 3","Option 4"],
+    "answer": "Option 2"
   }},
-  ...
+  {{
+    "type": "open",
+    "question": "Question text",
+    "answer": "Expected short answer"
+  }}
 ]
 
-Make sure the JSON is valid. If a question is 'open', set "options": [].
+Text:
+{trimmed_text}
+    """.strip()
 
-Here is the document:
-<<DOC>>
-{pdf_text[:30000]}
-<<ENDDOC>>
+    # Stage 3: model call
+    response = model.generate_content(prompt)
+    raw_output = (response.text or "").strip()
+    progress.progress(55)
+    status.text("Extracting and cleaning JSON...")
 
-Only produce the JSON array.
-"""
-    raw = gemini_generate_text(prompt, max_output_tokens=1500)
-    # parse JSON from response (model may put stray whitespace)
+    # Stage 4: extract JSON array if extra text slipped in
+    match = re.search(r"\[.*\]", raw_output, re.DOTALL)
+    if match:
+        raw_output = match.group(0)
+
+    raw_output = clean_json_string(raw_output)
+
+    # Stage 5: parse JSON
     try:
-        parsed = json.loads(raw)
-    except Exception as e:
-        # Attempt to recover if the model included ```json or other wrappers
-        cleaned = raw.strip()
-        # Try to find first '[' and last ']' to extract array
-        start = cleaned.find('[')
-        end = cleaned.rfind(']')
-        if start != -1 and end != -1:
-            maybe = cleaned[start:end+1]
-            parsed = json.loads(maybe)
-        else:
-            raise RuntimeError(f"Failed to parse JSON from Gemini response. Raw response:\n{raw}") from e
+        questions = json.loads(raw_output)
+        # Validate & normalize
+        normalized = []
+        for q in questions:
+            qtype = q.get("type", "").strip().lower()
+            qtext = q.get("question", "").strip()
+            ans = q.get("answer", "").strip()
+            if qtype == "mcq":
+                opts = [str(o).strip() for o in q.get("options", []) if str(o).strip()]
+                # If AI messed up and answer not in options, add it then dedup
+                if ans and ans not in opts:
+                    opts.append(ans)
+                # Keep only first 4 options
+                opts = opts[:4] if len(opts) >= 4 else opts
+                # Shuffle options for display
+                random.shuffle(opts)
+                normalized.append({
+                    "type": "mcq",
+                    "question": qtext,
+                    "options": opts,
+                    "answer": ans  # keep the CORRECT option text for evaluation later
+                })
+            else:
+                normalized.append({
+                    "type": "open",
+                    "question": qtext,
+                    "answer": ans
+                })
+        progress.progress(100)
+        status.text("✅ Questions generated successfully!")
+        time.sleep(0.3)
+        status.empty()
+        return normalized
+    except json.JSONDecodeError as e:
+        status.empty()
+        progress.progress(0)
+        st.error(f"❌ Could not parse questions JSON: {e}")
+        with st.expander("Show raw AI output"):
+            st.code(raw_output)
+        return []
 
-    questions = []
-    for obj in parsed:
-        q = Question(
-            id=int(obj.get("id")),
-            qtype=obj.get("type"),
-            question=obj.get("question"),
-            options=obj.get("options", []) or [],
-            correct_answer=str(obj.get("answer")) if obj.get("answer") is not None else None,
-            explanation=obj.get("explanation")
+def evaluate_open_answers_with_ai(pdf_text: str, open_qas: list[dict]) -> list[str]:
+    """
+    Uses Gemini to give brief feedback for open-ended answers.
+    Each item in open_qas: {"question":..., "expected":..., "user":...}
+    Returns a list of short feedback strings.
+    """
+    if not open_qas:
+        return []
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    # Keep context concise
+    context = pdf_text[:15000]
+
+    items = []
+    for i, qa in enumerate(open_qas, start=1):
+        items.append(
+            f"{i}. Q: {qa['question']}\n"
+            f"   Expected: {qa['expected']}\n"
+            f"   User: {qa['user']}\n"
         )
-        questions.append(q)
-    return questions
-
-def ask_gemini_to_grade(pdf_text: str, questions: List[Question], user_answers: Dict[int, str]) -> Dict[str, Any]:
-    """
-    Ask Gemini to grade the answers. Request strict JSON with per-question feedback and a final score.
-    Returns a dict: {"total_score": X, "max_score": Y, "per_question":[{...}, ...]}
-    """
-    # Build a compact representation
-    qlist = []
-    for q in questions:
-        q_obj = {
-            "id": q.id,
-            "type": q.qtype,
-            "question": q.question,
-            "options": q.options,
-            "correct_answer": q.correct_answer
-        }
-        qlist.append(q_obj)
+    joined = "\n".join(items)
 
     prompt = f"""
-You are an assistant grader. You will be given:
-- the document text (delimited by <<DOC>> <<ENDDOC>>),
-- the list of questions with their correct answers (delimited by <<QUESTIONS>> <<ENDQUESTIONS>>),
-- and the student's answers (delimited by <<ANSWERS>> <<ENDANSWERS>>).
+You are grading short answers based on the provided source text.
+For each item, give a brief verdict "Correct", "Partially correct", or "Incorrect" with ONE short sentence of feedback.
+Return plain text, one line per item in the same order, prefixed with the item number.
 
-For each question, produce:
-- a score (0 or 1 for MCQ and for open questions use partial credit between 0 and 1, to two decimals),
-- an explanation of why the answer is correct/incorrect,
-- and, for open questions, a short ideal answer.
+Source text (excerpt):
+{context}
 
-Then also produce a "total_score" (sum of the per-question scores) and "max_score" (equal to the number of questions, e.g. 6).
+Items:
+{joined}
+""".strip()
 
-Output MUST be valid JSON with this structure:
-{{
-  "total_score": float,
-  "max_score": float,
-  "per_question": [
-    {{
-      "id": 1,
-      "score": float,
-      "feedback": "text",
-      "ideal_answer": "..."  // include for open questions; for MCQ can echo the correct option
-    }},
-    ...
-  ]
-}}
+    resp = model.generate_content(prompt)
+    feedback = (resp.text or "").strip().splitlines()
+    # Ensure we return same length (fallbacks)
+    if len(feedback) < len(open_qas):
+        feedback += ["(No feedback generated)"] * (len(open_qas) - len(feedback))
+    return [line.strip() for line in feedback]
 
-Document:
-<<DOC>>
-{pdf_text[:30000]}
-<<ENDDOC>>
-
-Questions+answers:
-<<QUESTIONS>>
-{json.dumps(qlist)}
-<<ENDQUESTIONS>>
-
-Student answers:
-<<ANSWERS>>
-{json.dumps(user_answers)}
-<<ENDANSWERS>>
-
-Produce only the JSON.
-"""
-    raw = gemini_generate_text(prompt, max_output_tokens=1500)
-    try:
-        parsed = json.loads(raw)
-    except Exception as e:
-        cleaned = raw.strip()
-        start = cleaned.find('{')
-        end = cleaned.rfind('}')
-        if start != -1 and end != -1:
-            maybe = cleaned[start:end+1]
-            parsed = json.loads(maybe)
-        else:
-            raise RuntimeError(f"Failed to parse grading JSON. Raw response:\n{raw}") from e
-    return parsed
-
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="PDF Quiz Generator & Grader", layout="wide")
-
-st.title("PDF Quiz Generator & Grader")
-
+# -------------------- Session State --------------------
 if "questions" not in st.session_state:
-    st.session_state["questions"] = None
+    st.session_state.questions = []        # list of dicts
+if "answers" not in st.session_state:
+    st.session_state.answers = {}          # idx -> user answer
 if "pdf_text" not in st.session_state:
-    st.session_state["pdf_text"] = None
-if "generated_from_filename" not in st.session_state:
-    st.session_state["generated_from_filename"] = None
+    st.session_state.pdf_text = ""         # full text for evaluation context
 
-with st.sidebar:
-    st.header("Settings")
-    num_questions = st.number_input("Number of questions to generate", min_value=1, max_value=20, value=6, step=1)
-    model_choice = st.selectbox("Gemini model (if available)", options=["text-bison-001"], index=0)
-    regenerate = st.button("Force regenerate questions (clears previous)")
+# -------------------- UI --------------------
+uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
 
-uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+num_questions = st.slider("Number of questions to generate", 1, 10, 5)
 
-if uploaded_file is not None:
-    try:
-        text = extract_text_from_pdf(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to extract text from PDF: {e}")
-        st.stop()
+if uploaded_pdf and st.button("Generate Questions"):
+    # Extract text
+    with st.spinner("Extracting text from PDF..."):
+        pdf_text = extract_text_from_pdf(uploaded_pdf)
+    if not pdf_text:
+        st.error("No text could be extracted from this PDF.")
+    else:
+        st.session_state.pdf_text = pdf_text
+        # Generate questions (with progress bar)
+        qs = generate_questions_from_text(pdf_text, n=num_questions)
+        st.session_state.questions = qs
+        st.session_state.answers = {}  # reset any previous answers
 
-    st.session_state["pdf_text"] = text
-    # If different file than before, clear generated questions
-    if st.session_state.get("generated_from_filename") != uploaded_file.name:
-        st.session_state["questions"] = None
-        st.session_state["generated_from_filename"] = uploaded_file.name
+# Render questions
+if st.session_state.questions:
+    st.subheader("📝 Questions")
+    for i, q in enumerate(st.session_state.questions):
+        st.markdown(f"**Q{i+1}. {q['question']}**")
 
-    st.markdown("### Document preview (first 2000 chars)")
-    st.text(text[:2000] + ("..." if len(text) > 2000 else ""))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Generate Questions"):
-            with st.spinner("Generating questions from the document via Gemini..."):
-                try:
-                    questions = ask_gemini_for_questions(st.session_state["pdf_text"], num_questions=num_questions)
-                    st.session_state["questions"] = questions
-                    st.success(f"Generated {len(questions)} questions.")
-                except Exception as e:
-                    st.error(f"Failed to generate questions: {e}")
-
-    with col2:
-        if st.session_state["questions"]:
-            if st.button("Clear generated questions"):
-                st.session_state["questions"] = None
-                st.success("Cleared saved questions.")
-
-# Show questions if present
-if st.session_state.get("questions"):
-    st.header("Answer the questions")
-    answers = {}
-    for q in st.session_state["questions"]:
-        st.markdown(f"**Q{q.id}.** {q.question}")
-        if q.qtype.lower().startswith("mc"):
-            # display options
-            # label options as A,B,C,D for display
-            labels = ["A", "B", "C", "D", "E", "F"]
-            opt_map = {labels[i]: opt for i, opt in enumerate(q.options)}
-            choices_display = [f"{labels[i]}. {opt}" for i, opt in enumerate(q.options)]
-            ans = st.radio(f"Select answer for Q{q.id}", choices_display, key=f"q{q.id}")
-            # store just the chosen option text
-            selected_label = ans.split(".")[0]
-            answers[q.id] = opt_map[selected_label]
+        if q["type"] == "mcq":
+            # Radio buttons (choices displayed below the question)
+            choice = st.radio(
+                "Select your answer:",
+                q["options"],
+                key=f"mcq_{i}",
+                index=None
+            )
+            st.session_state.answers[i] = choice if choice is not None else ""
         else:
-            ans = st.text_input(f"Your answer for Q{q.id}", key=f"q{q.id}")
-            answers[q.id] = ans
+            # Open-ended text area below the question
+            ans = st.text_area(
+                "Your answer:",
+                key=f"open_{i}",
+                height=80,
+                placeholder="Type your response here..."
+            )
+            st.session_state.answers[i] = ans.strip()
 
-    if st.button("Submit answers for evaluation"):
-        with st.spinner("Evaluating answers with Gemini..."):
-            try:
-                grading = ask_gemini_to_grade(st.session_state["pdf_text"], st.session_state["questions"], answers)
-                st.session_state["grading"] = grading
-                st.success("Grading complete.")
-            except Exception as e:
-                st.error(f"Grading failed: {e}")
+    if st.button("Evaluate Answers"):
+        st.subheader("📊 Evaluation")
+        total = len(st.session_state.questions)
+        mcq_correct = 0
+        open_items_for_ai = []
 
-# Show grading results if present
-if st.session_state.get("grading"):
-    grading = st.session_state["grading"]
-    st.header("Results")
-    st.metric("Score", f"{grading.get('total_score')} / {grading.get('max_score')}")
-    for item in grading.get("per_question", []):
-        qid = item.get("id")
-        score = item.get("score")
-        feedback = item.get("feedback")
-        ideal = item.get("ideal_answer", "")
-        st.subheader(f"Q{qid} — Score: {score}")
-        st.write(feedback)
-        if ideal:
-            st.markdown(f"**Ideal / model answer:** {ideal}")
+        for i, q in enumerate(st.session_state.questions):
+            user_ans = st.session_state.answers.get(i, "")
+            correct = q.get("answer", "")
 
-    # Option: save report to docx
-    if st.button("Save results to DOCX"):
-        doc = Document()
-        doc.add_heading("PDF Quiz Results", level=1)
-        doc.add_paragraph(f"Source file: {st.session_state.get('generated_from_filename')}")
-        doc.add_paragraph(f"Score: {grading.get('total_score')} / {grading.get('max_score')}")
-        doc.add_paragraph("")
-        for item in grading.get("per_question", []):
-            qid = item.get("id")
-            qobj = next((q for q in st.session_state["questions"] if q.id == qid), None)
-            if qobj:
-                doc.add_heading(f"Q{qid}: {qobj.question}", level=2)
-            doc.add_paragraph(f"Score: {item.get('score')}")
-            doc.add_paragraph(f"Feedback: {item.get('feedback')}")
-            ideal = item.get("ideal_answer", "")
-            if ideal:
-                doc.add_paragraph(f"Ideal answer: {ideal}")
-            doc.add_paragraph("")
+            if q["type"] == "mcq":
+                if user_ans and user_ans.strip() == correct.strip():
+                    mcq_correct += 1
+                    st.success(f"Q{i+1}: ✅ Correct\n\nYour answer: {user_ans}")
+                else:
+                    st.error(f"Q{i+1}: ❌ Incorrect\n\nYour answer: {user_ans or '(no answer)'}\n\n**Correct:** {correct}")
+            else:
+                # Defer grading to AI for open-ended; still show expected
+                st.info(f"Q{i+1}: Your answer: {user_ans or '(no answer)'}\n\n**Expected:** {correct}")
+                open_items_for_ai.append({
+                    "question": q["question"],
+                    "expected": correct,
+                    "user": user_ans or "(no answer)"
+                })
 
-        filename = f"quiz_results_{st.session_state.get('generated_from_filename','doc')}.docx"
-        doc.save(filename)
-        with open(filename, "rb") as f:
-            st.download_button("Download results DOCX", f, file_name=filename)
+        # Summaries
+        st.write("---")
+        st.write(f"**MCQ score:** {mcq_correct} / {sum(1 for q in st.session_state.questions if q['type']=='mcq')}")
+
+        # Optional AI feedback for open-ended
+        if open_items_for_ai:
+            with st.spinner("Getting brief feedback for open-ended answers..."):
+                feedback_lines = evaluate_open_answers_with_ai(st.session_state.pdf_text, open_items_for_ai)
+            st.subheader("🧠 Open-ended Feedback")
+            for idx, line in enumerate(feedback_lines, start=1):
+                st.write(f"{idx}. {line}")

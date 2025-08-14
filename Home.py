@@ -63,11 +63,11 @@ def stream_gemini_response(prompt):
 
 
 st.set_page_config(
-    page_title="Study Assistant",
-    page_icon="🤖"
+    page_title="Thinkr",
+    page_icon="📖"
 )
 
-st.title("Tinkr")
+st.title("Thinkr")
 st.write("Thinkr is an AI study assistant app that enables students to study in an easier and more relaxed way. It combines all the "
          "necessary tools needed by the students during study periods. It has features such as a PDF Summarizer that can "
          "summarize PDFs making it easy for the students to read them. It also has a chatbot that allows the students to ask questions "

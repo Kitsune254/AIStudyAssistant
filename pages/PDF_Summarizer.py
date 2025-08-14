@@ -11,7 +11,14 @@ gemini_api_key = os.getenv('GEMINI_API_KEY')
 
 genai.configure(api_key=gemini_api_key)
 
+st.set_page_config(
+    page_title="Thinkr",
+    page_icon="📖"
+)
+
 st.title("PDF Summarizer")
+st.write("Summarize you long PDF documents into short texts that can be read easily and quickly. "
+         "All the important points are summarized for you.")
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
 
